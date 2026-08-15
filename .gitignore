@@ -1,0 +1,6 @@
+__pycache__
+.venv
+runs
+weights
+tokenizer_en.json
+.gitattributes
