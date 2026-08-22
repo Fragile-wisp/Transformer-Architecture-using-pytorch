@@ -159,9 +159,8 @@ def spec_decode(model_p, model_q, source, source_mask, tokenizer_tgt, max_len, d
     return decoder_input
 
 
-def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_state, writer, num_examples=2):
+def run_validation(model, model_q, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_state, writer, num_examples=2):
     model.eval()
-    model_q = model # Note: Replace with actual smaller draft model once instantiated
 
     count = 0
     console_width = 80
