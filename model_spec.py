@@ -35,8 +35,8 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
 
-    def forward(self, x):
-        x = x + (self.pe[:, :x.shape[1], :]).requires_grad_(False)
+    def forward(self, x, step=0):
+        x = x + (self.pe[:, step : step + x.shape[1], :]).requires_grad_(False)
         return self.dropout(x)
 
 class LayerNormalisation(nn.Module):
@@ -103,13 +103,22 @@ class MultiHeadAttentionBlock(nn.Module):
         key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1,2)
         value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1,2)
 
+        ### IMPLEMENTATION OF KV_CACHE FOR SPECULATIVE DECODING
+        if kv_cache is not None:
+            past_key, past_value = kv_cache
+            # Concatenate along the Sequence Length dimension (dim=2)
+            key = torch.cat([past_key, key], dim=2)
+            value = torch.cat([past_value, value], dim=2)
+
+        new_kv_cache = (key, value)
+
         x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
 
         # (Batch, Seq_Len, d_k) --> (Batch, Seq_Len, h, d_k) --> (Batch, Seq_Len, d_model)
         x = x.transpose(1,2).contiguous().view(x.shape[0], -1, self.h *self.d_k)
 
         # (Batch, Seq_Len, d_model) --> (Batch, Seq_Len, d_model)
-        return self.w_o(x)
+        return self.w_o(x), new_kv_cache
 
 class ResidualConnection(nn.Module):
 
@@ -130,7 +139,7 @@ class EncoderBlock(nn.Module):
         self.residual_connections = nn.ModuleList([ResidualConnection(dropout) for _ in range(2)])
 
     def forward(self, x, src_mask):
-        x = self.residual_connections[0](x, lambda x: self.self_attention_block(x, x, x, src_mask))
+        x = self.residual_connections[0](x, lambda x: self.self_attention_block(x, x, x, src_mask)[0])
         x = self.residual_connections[1](x, self.feed_forward_block)
         return x
 
@@ -155,11 +164,23 @@ class DecoderBlock(nn.Module):
         self.feed_forward_block = feed_forward_block
         self.residual_connections = nn.ModuleList([ResidualConnection(dropout) for _ in range(3)])
 
-    def forward(self, x, encoder_output, src_mask, tgt_mask):
-        x = self.residual_connections[0](x, lambda x: self.self_attention_block(x, x, x, tgt_mask))
-        x = self.residual_connections[1](x, lambda x: self.cross_attention_block(x, encoder_output, encoder_output, src_mask))
+    def forward(self, x, encoder_output, src_mask, tgt_mask, kv_cache=None):
+
+        #attn_out
+        norm_x = self.residual_connections[0].norm(x)
+        q = k = v = norm_x
+        attn_out, new_kv_cache = self.self_attention_block(q, k, v, tgt_mask, kv_cache=kv_cache)
+        x = x + self.residual_connections[0].dropout(attn_out)
+
+        #cross_out
+        norm_x = self.residual_connections[1].norm(x)
+        cross_out, _ = self.cross_attention_block(norm_x, encoder_output, encoder_output, src_mask, kv_cache=None)
+        x = x + self.residual_connections[1].dropout(cross_out)
+
+        #ff
         x = self.residual_connections[2](x, self.feed_forward_block)
-        return x
+
+        return x, new_kv_cache
 
 class Decoder(nn.Module):
 
@@ -168,10 +189,14 @@ class Decoder(nn.Module):
         self.layers = layers
         self.norm = LayerNormalisation()
 
-    def forward(self, x, encoder_output, src_mask, tgt_mask):
-        for layer in self.layers:
-            x = layer(x, encoder_output, src_mask, tgt_mask)
-        return self.norm(x)
+    def forward(self, x, encoder_output, src_mask, tgt_mask, kv_cache=None):
+        new_kv_caches = []
+        for idx, layer in enumerate(self.layers):
+            layer_cache = kv_cache[idx] if kv_cache is not None else None
+            x, new_layer_cache = layer(x, encoder_output, src_mask, tgt_mask, kv_cache=layer_cache)
+            new_kv_caches.append(new_layer_cache)
+
+        return self.norm(x), new_kv_caches
 
 class ProjectionLayer(nn.Module):
 
@@ -180,8 +205,7 @@ class ProjectionLayer(nn.Module):
         self.proj = nn.Linear(d_model, vocab_size)
 
     def forward(self, x):
-        # (Batch, Seq_Len, d_model) --> (Batch, Seq_Len, Vocab_Size)
-        return torch.log_softmax(self.proj(x), dim = -1)
+        return self.proj(x)
 
 class Transformer(nn.Module):
 
@@ -200,10 +224,12 @@ class Transformer(nn.Module):
         src = self.src_pos(src)
         return self.encoder(src, src_mask)
 
-    def decode(self, encoder_output, src_mask, tgt, tgt_mask):
+    def decode(self, encoder_output, src_mask, tgt, tgt_mask, kv_cache=None):
         tgt = self.tgt_embed(tgt)
-        tgt = self.tgt_pos(tgt)
-        return self.decoder(tgt, encoder_output, src_mask, tgt_mask)
+        step = kv_cache[0][0].shape[2] if kv_cache is not None else 0
+
+        tgt = self.tgt_pos(tgt, step=step)
+        return self.decoder(tgt, encoder_output, src_mask, tgt_mask, kv_cache=kv_cache)
 
     def project(self, x):
         return self.projection_layer(x)
